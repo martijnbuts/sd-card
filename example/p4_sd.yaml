@@ -1,0 +1,124 @@
+# ─── microSD card (TF slot) on the Waveshare ESP32-P4-WIFI6-Touch-LCD-7B ─────────────────────
+# Use as a package next to your existing device config:
+#   packages:
+#     sd: !include p4_sd.yaml
+#
+# Slot pins: CLK 43, CMD 44, D0-D3 39-42 (Waveshare wiki, example 09_sdmmc).
+# Slot power: on-chip LDO channel 4 at 3.3 V (passthrough), as in that example.
+# The card shows up as /sdcard; FAT32 and exFAT (sd_bus_shared: exfat).
+#
+# SPI mode instead of SDMMC 4-bit: the P4 has a single SDMMC controller and esp32_hosted already
+# uses it for the Wi-Fi co-processor (C6, slot 1). Even on ESP-IDF 6.1 Wi-Fi dropped as soon as the
+# card ran in SDMMC mode (the controller's clock divider is shared by both slots, and sd_storage
+# calls sdmmc_host_deinit() after a failed mount, which removes the Wi-Fi slot too). In SPI mode the
+# card never touches the SDMMC controller. Costs speed (about 2 MB/s instead of 10-20 MB/s), which
+# is plenty for files, logs and images.
+#   SPI3 (SPI2 stays free, e.g. for a W5500): CLK 43, MOSI = CMD 44, MISO = D0 39, CS = D3 42.
+#   D1 40 and D2 41 are unused in SPI mode and get a pull-up.
+#
+# Files: storage and sd_storage from the p1ngb4ck fork (branch testing_dev), because upstream
+# ESPHome has no SD support yet. Pinned to a commit: testing_dev changes daily.
+# Actions you get: storage.file_read / file_write / file_append / file_delete / list_dir /
+# file_exists, and sd_storage.mount / unmount / list_files / is_mounted.
+#
+# Tested on: ESPHome 2026.11.0-dev, ESP-IDF 6.1.0 (esp32: framework: version: 6.1.0),
+# esp32_hosted with ESP32-C6 over SDIO, 64 GB exFAT card.
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/p1ngb4ck/esphome
+      ref: caa97336f20007c905b2f3ce89bee87a8f4595f4
+    components: [storage, sd_storage]
+  # sd_bus_shared: fixes so the fork's sd_storage builds on upstream ESPHome-dev and IDF 6.1,
+  # plus exFAT. The SDMMC wrappers (wrap_sdmmc) are only for SDMMC mode and stay off here.
+  - source:
+      type: git
+      url: https://github.com/martijnbuts/sd-card
+    components: [sd_bus_shared]
+
+sd_bus_shared:
+  # Read exFAT cards (64 GB and larger) without reformatting (patched FatFs, see the component)
+  exfat: true
+
+esp_ldo:
+  - channel: 4
+    voltage: passthrough
+
+spi:
+  - id: sd_spi_bus
+    interface: spi3
+    clk_pin: GPIO43
+    mosi_pin: GPIO44
+    miso_pin: GPIO39
+
+sd_storage:
+  id: sd_card
+  type: sd_spi
+  spi_id: sd_spi_bus
+  cs_pin: GPIO42
+  data1_pin: GPIO40
+  data2_pin: GPIO41
+  data_rate: 20MHz
+  # Only the card on this bus: reads and writes may run on the background worker task
+  assume_exclusive_bus: true
+  mount_path: /sdcard
+  on_mounted:
+    - logger.log:
+        level: INFO
+        tag: sd
+        format: "SD card mounted at %s"
+        args: [mount_path]
+    - component.update: sd_free
+
+# Safely eject / mount again from Home Assistant
+button:
+  - platform: template
+    name: "SD card unmount"
+    icon: mdi:eject
+    entity_category: config
+    on_press:
+      - sd_storage.unmount: sd_card
+      - component.update: sd_free
+  - platform: template
+    name: "SD card mount"
+    icon: mdi:micro-sd
+    entity_category: config
+    on_press:
+      - sd_storage.mount: sd_card
+      - component.update: sd_free
+
+binary_sensor:
+  - platform: template
+    name: "SD card mounted"
+    icon: mdi:micro-sd
+    entity_category: diagnostic
+    lambda: "return id(sd_card)->is_mounted();"
+
+# Size and free space (GB); empty while no card is mounted
+sensor:
+  - platform: template
+    name: "SD card free"
+    id: sd_free
+    icon: mdi:micro-sd
+    unit_of_measurement: GB
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 10min
+    lambda: |-
+      storage::StorageInfo info[1] = {};
+      if (!id(sd_card)->is_mounted() ||
+          id(sd_card)->get_info(info) != storage::StorageError::STORAGE_ERROR_OK) {
+        id(sd_size).publish_state(NAN);
+        return NAN;
+      }
+      id(sd_size).publish_state(info[0].total_bytes / 1e9f);
+      return info[0].free_bytes / 1e9f;
+  - platform: template
+    name: "SD card size"
+    id: sd_size
+    icon: mdi:micro-sd
+    unit_of_measurement: GB
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: never
